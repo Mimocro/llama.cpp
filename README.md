@@ -1,6 +1,36 @@
 # llama.cpp
 
 > [!IMPORTANT]
+> **This is a fork of a PrismMl fork of lla,a.cpp**, just adapted trinary model execution path to be able to use LORA's on top of the ternary bonsai 2. And added a tool to train LORA itself. Mostly slop coded. Manually rechecked, and validated (kinda)
+>
+> **quickstart**:
+>
+
+```bash
+# layers to train. those for ub 512 and 16gb vram
+T="attn_q.weight,attn_k.weight,attn_v.weight,attn_output.weight,attn_qkv.weight,attn_gate.weight,ssm_alpha.weight,ssm_
+beta.weight,ssm_out.weight,ffn_gate.weight,ffn_up.weight,ffn_down.weight"
+
+# init lora adapter
+llama-lora-init m model/Ternary-Bonsai-2-27B-PQ2_0.gguf \ 
+    -o "adapter/init.gguf" \ 
+    -r 16 --alpha 16 --layers 56:63 --targets $T
+
+# train lora
+=llama-lora-train.exe \ 
+    -m model/Ternary-Bonsai-2-27B-PQ2_0.gguf \ 
+    --lora "adapter/init.gguf" \ 
+    -f dataset.jsonl \ 
+    -o "adapter/trained.gguf" \ 
+    -c 512 -b 512 -ub 512 -ngl 99 --fit off \ 
+    -lr 5e-6 -epochs 2 -val-split 0.1
+```
+
+> load with normal llama-server/llama-cli with `--lora` flag normally
+
+---
+
+> [!IMPORTANT]
 > **This is the PrismML fork of llama.cpp**, the main line behind the [Bonsai](https://huggingface.co/collections/prism-ml/bonsai) models (branch `prism`, developed as `prism-v7`). It tracks current mainline llama.cpp and adds the fork's low-bit formats and runtime features on top.
 >
 > **New here? Start with the [Bonsai-demo](https://github.com/PrismML-Eng/Bonsai-demo) repo.** It downloads the right models and the correct prebuilt binaries for your hardware/backend automatically.
