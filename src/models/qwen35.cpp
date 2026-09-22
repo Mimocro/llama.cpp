@@ -1,6 +1,30 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
 
+// ggml_ssm_conv has no backward pass, so training runs the same convolution as a sum of taps
+static ggml_tensor * build_ssm_conv_taps(ggml_context * ctx, ggml_tensor * sx, ggml_tensor * c) {
+    const int64_t d_conv  = c->ne[0];
+    const int64_t d_inner = c->ne[1];
+    const int64_t n_t     = sx->ne[0] - d_conv + 1;
+    const int64_t n_s     = sx->ne[2];
+
+    ggml_tensor * res = nullptr;
+
+    for (int64_t i = 0; i < d_conv; ++i) {
+        ggml_tensor * x = ggml_view_3d(ctx, sx, n_t, d_inner, n_s, sx->nb[1], sx->nb[2], i*sx->nb[0]);
+        x = ggml_cont(ctx, ggml_transpose(ctx, x));
+
+        ggml_tensor * w = ggml_view_2d(ctx, c, 1, d_inner, c->nb[1], i*c->nb[0]);
+        w = ggml_cont(ctx, ggml_transpose(ctx, w));
+
+        ggml_tensor * tap = ggml_mul(ctx, x, w);
+
+        res = res ? ggml_add(ctx, res, tap) : tap;
+    }
+
+    return res;
+}
+
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
     ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS,    hparams.rope_sections, 4, true);
@@ -175,7 +199,17 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
 
     cb(inpL, "model.input_embed", -1);
 
-    auto * inp = build_inp_mem_hybrid();
+    llm_graph_input_mem_hybrid    * inp    = nullptr;
+    llm_graph_input_rs            * inp_rs = nullptr;
+    llm_graph_input_attn_no_cache * inp_nc = nullptr;
+
+    // training runs the full sequence at once, so attention needs no KV cache
+    if (cparams.lora_training) {
+        inp_rs = build_rs_inp_hybrid();
+        inp_nc = build_attn_inp_no_cache();
+    } else {
+        inp = build_inp_mem_hybrid();
+    }
 
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
@@ -198,10 +232,10 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
         // Determine layer type and build appropriate attention mechanism
         if (hparams.is_recr(il)) {
             // Linear attention layer (gated delta net)
-            cur = build_layer_attn_linear(inp->get_recr(), cur, il);
+            cur = build_layer_attn_linear(inp ? inp->get_recr() : inp_rs, cur, il);
         } else {
             // Full attention layer
-            cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il);
+            cur = build_layer_attn(inp ? inp->get_attn() : nullptr, cur, inp_pos, sections, il, inp_nc);
         }
 
         if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked && cparams.n_capture_layers == 0) {
@@ -324,7 +358,8 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
         ggml_tensor *             cur,
         ggml_tensor *             inp_pos,
         int *                     sections,
-        int                       il) {
+        int                       il,
+        llm_graph_input_attn_no_cache * inp_nc) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
@@ -383,7 +418,11 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     // Attention computation
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
-    cur = build_attn(inp,
+    cur = inp_nc
+        ? build_attn(inp_nc,
+                nullptr, nullptr, nullptr,
+                Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il)
+        : build_attn(inp,
                 nullptr, nullptr, nullptr,
                 Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
     cb(cur, "attn_pregate", il);
@@ -491,7 +530,9 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
         cb(state, "state_predelta", il);
     }
 
-    ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+    ggml_tensor * conv_output_proper = cparams.lora_training
+        ? build_ssm_conv_taps(ctx0, conv_input, conv_kernel)
+        : ggml_ssm_conv(ctx0, conv_input, conv_kernel);
     cb(conv_output_proper, "conv_output_raw", il);
 
     ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);

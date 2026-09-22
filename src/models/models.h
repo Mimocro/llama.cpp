@@ -2275,7 +2275,8 @@ struct llama_model_qwen35 : public llama_model_base {
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
                             int * sections,
-                            int   il);
+                            int   il,
+        llm_graph_input_attn_no_cache * inp_nc = nullptr);
 
         ggml_tensor * build_layer_attn_linear(
              llm_graph_input_rs * inp,

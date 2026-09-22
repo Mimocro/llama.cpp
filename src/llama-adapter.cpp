@@ -498,3 +498,54 @@ const llama_token * llama_adapter_get_alora_invocation_tokens(const llama_adapte
     GGML_ASSERT(adapter);
     return adapter->alora_invocation_tokens.data();
 }
+
+bool llama_adapter_lora_save_to_file(const llama_adapter_lora * adapter, const char * path_adapter) {
+    if (!adapter) {
+        return false;
+    }
+
+    gguf_context_ptr ctx_gguf { gguf_init_empty() };
+
+    // keep the metadata of the adapter this one was loaded from
+    for (const auto & [key, val] : adapter->gguf_kv) {
+        gguf_set_val_str(ctx_gguf.get(), key.c_str(), val.c_str());
+    }
+
+    gguf_set_val_str(ctx_gguf.get(), "general.type",       "adapter");
+    gguf_set_val_str(ctx_gguf.get(), "adapter.type",       "lora");
+    gguf_set_val_f32(ctx_gguf.get(), "adapter.lora.alpha", adapter->alpha);
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ ggml_tensor_overhead()*2*adapter->ab_map.size() + 1024*1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx { ggml_init(params) };
+    if (!ctx) {
+        return false;
+    }
+
+    // the weights live in backend buffers, so read them back before writing
+    std::vector<std::vector<uint8_t>> data;
+    data.reserve(2*adapter->ab_map.size());
+
+    for (const auto & [name, w] : adapter->ab_map) {
+        for (ggml_tensor * src : { w.a, w.b }) {
+            ggml_tensor * cur = ggml_dup_tensor(ctx.get(), src);
+            ggml_set_name(cur, ggml_get_name(src));
+
+            data.emplace_back(ggml_nbytes(src));
+            ggml_backend_tensor_get(src, data.back().data(), 0, ggml_nbytes(src));
+
+            gguf_add_tensor(ctx_gguf.get(), cur);
+            gguf_set_tensor_data(ctx_gguf.get(), ggml_get_name(cur), data.back().data());
+        }
+    }
+
+    if (!gguf_write_to_file(ctx_gguf.get(), path_adapter, false)) {
+        LLAMA_LOG_ERROR("%s: failed to write '%s'\n", __func__, path_adapter);
+        return false;
+    }
+
+    return true;
+}

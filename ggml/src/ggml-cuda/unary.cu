@@ -141,6 +141,14 @@ void ggml_cuda_op_unary(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     void * dst_d = dst->data;
     cudaStream_t stream = ctx.stream();
 
+    if (!ggml_is_contiguous(src0)) {
+        fprintf(stderr, "UNARY-DIAG unary=%s src0='%s' src0_op=%s ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu]\n",
+                dst->op == GGML_OP_UNARY ? ggml_unary_op_name(ggml_get_unary_op(dst)) : ggml_op_name(dst->op),
+                src0->name, ggml_op_name(src0->op),
+                (long long) src0->ne[0], (long long) src0->ne[1], (long long) src0->ne[2], (long long) src0->ne[3],
+                src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3]);
+    }
+
     GGML_ASSERT(ggml_is_contiguous(src0));
 
     GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);

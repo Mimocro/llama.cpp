@@ -1424,6 +1424,7 @@ struct llm_graph_context {
             const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows) const;
 
     llm_graph_input_rs * build_rs_inp() const;
+    llm_graph_input_rs * build_rs_inp_hybrid() const; // recurrent part only, for training without KV cache
 
     ggml_tensor * build_rs(
             llm_graph_input_rs * inp,

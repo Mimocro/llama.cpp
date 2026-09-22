@@ -1577,6 +1577,12 @@ ggml_tensor * llm_graph_context::build_lora_mm(
 
     ggml_tensor * res = ggml_mul_mat(ctx0, w, cur_mm);
 
+    // MMQ quantizes the activations while the backward pass does not, so the two do not match exactly.
+    // The exact path costs a dequantized copy of every weight, so it stays opt-in.
+    if (cparams.lora_training && ggml_is_quantized(w->type) && getenv("LLAMA_LORA_EXACT_FORWARD")) {
+        ggml_mul_mat_set_prec(res, GGML_PREC_F32);
+    }
+
     if (w_s) {
         res = ggml_mul(ctx0, res, w_s);
     }
@@ -3580,6 +3586,14 @@ llm_graph_input_rs * llm_graph_context::build_rs_inp() const {
     const auto * mctx_cur = static_cast<const llama_memory_recurrent_context *>(mctx);
 
     auto inp = build_rs_inp_impl(ctx0, ubatch, mctx_cur);
+
+    return (llm_graph_input_rs *) res->add_input(std::move(inp));
+}
+
+llm_graph_input_rs * llm_graph_context::build_rs_inp_hybrid() const {
+    const auto * mctx_cur = static_cast<const llama_memory_hybrid_context *>(mctx);
+
+    auto inp = build_rs_inp_impl(ctx0, ubatch, mctx_cur->get_recr());
 
     return (llm_graph_input_rs *) res->add_input(std::move(inp));
 }

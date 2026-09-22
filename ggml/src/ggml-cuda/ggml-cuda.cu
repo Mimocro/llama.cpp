@@ -1833,6 +1833,13 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
 
+    // MMQ quantizes the activations, while the backward pass uses the weights as they are.
+    // An exact forward pass keeps the two consistent, at the cost of dequantizing src0.
+    if (ggml_get_op_params_i32(dst, 0) == GGML_PREC_F32 && ggml_is_quantized(src0->type)) {
+        ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+        return;
+    }
+
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
 
@@ -5269,7 +5276,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 }
             } break;
         case GGML_OP_OUT_PROD:
-            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
+            // a quantized src0 is dequantized into a pool buffer first
+            return op->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                (op->src[0]->type == GGML_TYPE_F32 || ggml_get_to_fp32_nc_cuda(op->src[0]->type) != nullptr);
         case GGML_OP_GET_ROWS:
             {
                 switch (op->src[0]->type) {

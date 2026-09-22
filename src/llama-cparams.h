@@ -62,6 +62,7 @@ struct llama_cparams {
     bool auto_fhc;
     bool no_perf;
     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
+    bool lora_training = false; // train LoRA adapters: no KV cache, no inplace ops
     bool op_offload;
     bool kv_unified;
     bool pipeline_parallel;

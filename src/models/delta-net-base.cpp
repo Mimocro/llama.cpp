@@ -1,5 +1,7 @@
 #include "models.h"
 
+#include <vector>
+
 #include "llama-impl.h"
 #include "llama-memory-recurrent.h"
 
@@ -153,7 +155,7 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     cb(attn, "attn", il);
 
     ggml_tensor * identity;
-    identity = ggml_view_1d(ctx0, attn, CS, 0);
+    identity = cparams.lora_training ? ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, CS) : ggml_view_1d(ctx0, attn, CS, 0);
     identity = ggml_fill   (ctx0, identity, 1.0f);
     identity = ggml_diag   (ctx0, identity);
 
@@ -232,6 +234,9 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     // [CS, S_v, n_chunks, H_v * n_seqs]
     ggml_tensor * v_t = ggml_cont(ctx0, ggml_transpose(ctx0, v));
 
+    // training collects the chunks instead of writing into v, so the backward pass stays on views
+    std::vector<ggml_tensor *> v_chunks;
+
     for (int64_t chunk = 0; chunk < n_chunks; chunk++) {
         ggml_tensor * ch_k_cd    = get_slice_2d(ctx0, k_cd,    chunk); // [S_k,  CS, 1, H_k * n_seqs]
         ggml_tensor * ch_v_t     = get_slice_2d(ctx0, v_t,     chunk); // [ CS, S_v, 1, H_v * n_seqs]
@@ -259,7 +264,11 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
         ggml_tensor * o_ch = ggml_add(ctx0, attn_inter, v_attn);
         cb(o_ch, "dnet_add_ch_attn_out", il);
 
-        v = ggml_set_inplace(ctx0, v, o_ch, v->nb[1], v->nb[2], v->nb[3], chunk * v->nb[2]);
+        if (cparams.lora_training) {
+            v_chunks.push_back(o_ch);
+        } else {
+            v = ggml_set_inplace(ctx0, v, o_ch, v->nb[1], v->nb[2], v->nb[3], chunk * v->nb[2]);
+        }
 
         // kgdmulvnew = (key_gdiff).transpose(-1, -2) @ v_new
         // TODO: head broadcast might not work here - probably will need a transpose
@@ -271,6 +280,13 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
         s = ggml_mul(ctx0, s, ch_g_last_exp_t);
         s = ggml_add(ctx0, s, kgv);
         cb(s, "dnet_add_ch_state", il);
+    }
+
+    if (!v_chunks.empty()) {
+        v = v_chunks[0];
+        for (size_t i = 1; i < v_chunks.size(); ++i) {
+            v = ggml_concat(ctx0, v, v_chunks[i], 2);
+        }
     }
 
     // truncate padded tokens

@@ -3582,6 +3582,32 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     GGML_ASSERT(model->hparams.n_ctx_train % n_batch  == 0);
     GGML_ASSERT(n_batch                    % n_ubatch == 0);
 
+    // with adapters loaded, train only the adapters and keep the model frozen
+    const bool train_lora = loras && !loras->empty();
+
+    if (train_lora) {
+        cparams.lora_training = true;
+
+        // these have no backward pass
+        cparams.flash_attn   = false;
+        cparams.auto_fa      = false;
+        cparams.fused_gdn_ar = false;
+        cparams.fused_gdn_ch = false;
+        cparams.auto_fgdn    = false;
+
+        // the backward graph holds several times the nodes of the forward one
+        const uint32_t n_tokens_max = std::min(cparams.n_ctx, cparams.n_ubatch);
+        const size_t   max_nodes    = 8*graph_max_nodes(n_tokens_max);
+
+        gf_res_prev.reset(new llm_graph_result(max_nodes));
+        gf_res_reserve.reset(new llm_graph_result(max_nodes));
+
+        sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+                    max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+
+        LLAMA_LOG_INFO("%s: training LoRA adapters, max_nodes = %zu\n", __func__, max_nodes);
+    }
+
     ggml_opt_params opt_params = ggml_opt_default_params(sched.get(), GGML_OPT_LOSS_TYPE_CROSS_ENTROPY);
     opt_params.opt_period      = n_batch / n_ubatch;
     opt_params.get_opt_pars    = lopt_params.get_opt_pars;
@@ -3591,6 +3617,17 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
 
     llama_opt_param_filter param_filter = lopt_params.param_filter;
     void * param_filter_ud              = lopt_params.param_filter_ud;
+
+    if (train_lora) {
+        for (const auto & [adapter, scale] : *loras) {
+            for (auto & [name, w] : adapter->ab_map) {
+                llama_set_param(w.a, param_filter, param_filter_ud);
+                llama_set_param(w.b, param_filter, param_filter_ud);
+            }
+        }
+
+        return;
+    }
 
   //llama_set_param(model->tok_embd,        param_filter, param_filter_ud); // FIXME
     llama_set_param(model->type_embd,       param_filter, param_filter_ud);
@@ -3690,7 +3727,8 @@ void llama_context::opt_epoch_iter(
             struct ggml_context * ctx_compute_opt;
             {
                 const size_t size_gf = ggml_graph_size(gf);
-                const size_t size_meta = 4*size_gf*ggml_tensor_overhead() + 2*ggml_graph_overhead_custom(size_gf, /*grads = */ true);
+                // the backward graph is several times the size of the forward one
+                const size_t size_meta = 16*size_gf*ggml_tensor_overhead() + 2*ggml_graph_overhead_custom(4*size_gf, /*grads = */ true);
                 struct ggml_init_params params = {
                     /*.mem_size   =*/ size_meta,
                     /*.mem_buffer =*/ nullptr,
@@ -3709,6 +3747,10 @@ void llama_context::opt_epoch_iter(
                 const float onef = 1.0f;
                 for (uint32_t pos_ubatch = 0; pos_ubatch < n_ubatch; ++pos_ubatch) {
                     const uint32_t ilabel = pos_ctx + pos_batch + pos_ubatch;
+                    // a negative label masks the position out: it keeps an all-zero row and adds nothing to the loss
+                    if (labels_sparse[ilabel] < 0) {
+                        continue;
+                    }
                     GGML_ASSERT(labels_sparse[ilabel] < labels->ne[0]);
                     ggml_backend_tensor_set(labels, &onef, (pos_ubatch*labels->ne[0] + labels_sparse[ilabel])*sizeof(float), sizeof(float));
                 }

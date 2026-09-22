@@ -486,7 +486,9 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     }
 
     // gb_grad == graph backward gradients, forward pass, then backward pass to calculate gradients.
-    opt_ctx->gb_grad = ggml_graph_dup(opt_ctx->ctx_compute, opt_ctx->gf, /*force_grads =*/ true);
+    // the backward pass adds more nodes than the forward pass holds, so reserve room for them
+    opt_ctx->gb_grad = ggml_new_graph_custom(opt_ctx->ctx_compute, 4*ggml_graph_size(opt_ctx->gf), /*grads =*/ true);
+    ggml_graph_cpy(opt_ctx->gf, opt_ctx->gb_grad);
     ggml_build_backward_expand(opt_ctx->ctx_compute, opt_ctx->gb_grad, opt_ctx->grad_accs.data());
 
     if (opt_ctx->buf_static) {
