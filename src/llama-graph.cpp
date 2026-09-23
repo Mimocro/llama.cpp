@@ -1577,12 +1577,6 @@ ggml_tensor * llm_graph_context::build_lora_mm(
 
     ggml_tensor * res = ggml_mul_mat(ctx0, w, cur_mm);
 
-    // MMQ quantizes the activations while the backward pass does not, so the two do not match exactly.
-    // The exact path costs a dequantized copy of every weight, so it stays opt-in.
-    if (cparams.lora_training && ggml_is_quantized(w->type) && getenv("LLAMA_LORA_EXACT_FORWARD")) {
-        ggml_mul_mat_set_prec(res, GGML_PREC_F32);
-    }
-
     if (w_s) {
         res = ggml_mul(ctx0, res, w_s);
     }

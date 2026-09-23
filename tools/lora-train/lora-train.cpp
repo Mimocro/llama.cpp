@@ -105,6 +105,8 @@ static std::vector<train_seq> load_dataset(
                     msg.role    = m.value("role",    std::string());
                     msg.content = m.value("content", std::string());
 
+                    msg.reasoning_content = m.value("reasoning_content", std::string());
+
                     // OpenAI shaped tool calls, so agent traces can be used as they are
                     if (m.contains("tool_calls")) {
                         const common_json & tcs = m.at("tool_calls");
@@ -237,12 +239,7 @@ int main(int argc, char ** argv) {
     LOG_INF("%s: %zu sequences of %" PRId64 " tokens, %.1f%% of the positions are supervised\n",
             __func__, seqs.size(), n_ctx_data, 100.0*supervised_ratio);
 
-    // the loss averages over every position, so masking scales the gradient down by that ratio
     struct lr_opt & lr = params.lr;
-    if (supervised_ratio > 0.0 && supervised_ratio < 1.0) {
-        lr.lr0 /= (float) supervised_ratio;
-        LOG_INF("%s: scaling lr to %.2g to compensate for the masked positions\n", __func__, (double) lr.lr0);
-    }
 
     LOG_INF("%s: -optimizer %s -lr0 %.2g -wd %.2g -lr-min %.2g -min-epochs %.2g -epochs %d -period %.2g -val %.2g\n",
             __func__, ggml_opt_optimizer_name(params.optimizer), (double) lr.lr0, (double) lr.wd, (double) lr.lr_min,
