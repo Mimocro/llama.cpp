@@ -4445,6 +4445,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) { params.val_split = std::stof(value); }
     ).set_examples({ LLAMA_EXAMPLE_FINETUNE }));
     add_opt(common_arg(
+        {"--train-format"}, "chat|tokens|text",
+        "dataset format (default: chat)\n"
+        "chat: JSONL, one {\"messages\": [...], \"tools\": [...]} per line, rendered with the jinja template, only assistant turns are trained on\n"
+        "tokens: JSONL, one {\"tokens\": [...]} per line, token ids taken as is, every token is trained on\n"
+        "text: the file as it is, every token is trained on",
+        [](common_params & params, const std::string & value) {
+            if (value != "chat" && value != "tokens" && value != "text") {
+                throw std::invalid_argument("invalid --train-format, valid options: chat, tokens, text");
+            }
+            params.train_format = value;
+        }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE }));
+    add_opt(common_arg(
         {"-epochs", "--epochs"}, "N",
         string_format("optimizer max # of epochs (default: %d)", params.lr.epochs),
         [](common_params & params, int epochs) { params.lr.epochs = epochs; }

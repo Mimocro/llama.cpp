@@ -5,46 +5,44 @@
 #include "log.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <clocale>
-#include <cmath>
 #include <cstdio>
-#include <cstring>
 #include <string>
 #include <vector>
 
 // trains a LoRA adapter on top of a frozen base model
 //
-// the dataset is either a JSONL file with one {"messages": [...]} object per line, in which case
-// only the assistant turns are supervised, or plain text, in which case every token is
 
 struct train_seq {
     std::vector<llama_token> tokens;
     std::vector<llama_token> labels; // -1 marks a position that does not contribute to the loss
 };
 
-static std::string render_prompt(
+static std::string render(
         const common_chat_templates * tmpls,
         const std::vector<common_chat_msg> & messages,
+        const std::vector<common_chat_tool> & tools,
         size_t n_msg,
         bool add_generation_prompt) {
     common_chat_templates_inputs inputs;
     inputs.messages.assign(messages.begin(), messages.begin() + n_msg);
+    inputs.tools                 = tools;
     inputs.add_generation_prompt = add_generation_prompt;
     inputs.use_jinja             = true;
 
     return common_chat_templates_apply(tmpls, inputs).prompt;
 }
 
-static bool seq_from_messages(
+static train_seq chat_seq(
         llama_context * ctx,
         const common_chat_templates * tmpls,
         const std::vector<common_chat_msg> & messages,
-        train_seq & out) {
-    const std::string full = render_prompt(tmpls, messages, messages.size(), false);
-
-    out.tokens = common_tokenize(ctx, full, true, true);
-    out.labels.assign(out.tokens.size(), -1);
+        const std::vector<common_chat_tool> & tools) {
+    train_seq seq;
+    seq.tokens = common_tokenize(ctx, render(tmpls, messages, tools, messages.size(), false), true, true);
+    seq.labels.assign(seq.tokens.size(), -1);
 
     // an assistant turn owns the tokens it adds on top of its own generation prompt
     for (size_t i = 0; i < messages.size(); ++i) {
@@ -52,111 +50,143 @@ static bool seq_from_messages(
             continue;
         }
 
-        const size_t n_prefix = common_tokenize(ctx, render_prompt(tmpls, messages, i,     true),  true, true).size();
-        const size_t n_turn   = common_tokenize(ctx, render_prompt(tmpls, messages, i + 1, false), true, true).size();
+        const size_t begin = common_tokenize(ctx, render(tmpls, messages, tools, i,     true),  true, true).size();
+        const size_t end   = common_tokenize(ctx, render(tmpls, messages, tools, i + 1, false), true, true).size();
 
-        for (size_t pos = n_prefix; pos < n_turn && pos < out.tokens.size(); ++pos) {
-            out.labels[pos - 1] = out.tokens[pos];
+        for (size_t pos = std::max<size_t>(begin, 1); pos < end && pos < seq.tokens.size(); ++pos) {
+            seq.labels[pos - 1] = seq.tokens[pos];
         }
     }
 
-    return out.tokens.size() > 1;
+    return seq;
 }
 
-static std::vector<train_seq> load_dataset(
+static std::vector<train_seq> load_chat(
         llama_context * ctx,
         const common_chat_templates * tmpls,
-        const std::string & text,
-        int64_t n_ctx_data) {
+        const std::string & text) {
     std::vector<train_seq> seqs;
+    int64_t n_bad   = 0;
+    int64_t n_empty = 0;
 
-    bool as_chat = false;
-    {
-        std::string first;
-        for (char c : text) {
-            if (c == '\n') break;
-            first += c;
+    size_t pos    = 0;
+    size_t n_line = 0;
+    while (pos < text.size()) {
+        const size_t end = text.find('\n', pos);
+        const std::string line = text.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+        pos = end == std::string::npos ? text.size() : end + 1;
+        n_line++;
+
+        if (line.find_first_not_of(" \t\r") == std::string::npos) {
+            continue;
         }
-        as_chat = first.find("\"messages\"") != std::string::npos;
+
+        std::vector<common_chat_msg>  messages;
+        std::vector<common_chat_tool> tools;
+        try {
+            const common_json j = common_json::parse(line);
+            messages = common_chat_msgs_parse_oaicompat(j.at("messages"));
+            if (j.contains("tools")) {
+                tools = common_chat_tools_parse_oaicompat(j.at("tools"));
+            }
+        } catch (const std::exception & e) {
+            if (n_bad++ == 0) {
+                LOG_WRN("%s: line %zu: %s\n", __func__, n_line, e.what());
+            }
+            continue;
+        }
+
+        train_seq seq = chat_seq(ctx, tmpls, messages, tools);
+
+        bool supervised = false;
+        for (llama_token l : seq.labels) {
+            supervised |= l >= 0;
+        }
+        if (!supervised) {
+            n_empty++;
+            continue;
+        }
+
+        seqs.push_back(std::move(seq));
     }
 
-    if (as_chat) {
-        size_t pos = 0;
-        int64_t n_bad = 0;
-        while (pos < text.size()) {
-            const size_t end  = text.find('\n', pos);
-            const std::string line = text.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
-            pos = end == std::string::npos ? text.size() : end + 1;
-            if (line.find_first_not_of(" \t\r") == std::string::npos) {
-                continue;
+    if (n_bad > 0) {
+        LOG_WRN("%s: skipped %" PRId64 " malformed lines, the first one is shown above\n", __func__, n_bad);
+    }
+    if (n_empty > 0) {
+        LOG_WRN("%s: skipped %" PRId64 " lines without an assistant turn\n", __func__, n_empty);
+    }
+
+    return seqs;
+}
+
+static bool load_tokens(const std::string & text, int32_t n_vocab, std::vector<train_seq> & seqs) {
+    int64_t n_bad = 0;
+
+    size_t pos    = 0;
+    size_t n_line = 0;
+    while (pos < text.size()) {
+        const size_t end = text.find('\n', pos);
+        const std::string line = text.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+        pos = end == std::string::npos ? text.size() : end + 1;
+        n_line++;
+
+        if (line.find_first_not_of(" \t\r") == std::string::npos) {
+            continue;
+        }
+
+        train_seq seq;
+        try {
+            seq.tokens = common_json::parse(line).at("tokens").get<std::vector<int>>();
+        } catch (const std::exception & e) {
+            if (n_bad++ == 0) {
+                LOG_WRN("%s: line %zu: %s\n", __func__, n_line, e.what());
             }
-
-            std::vector<common_chat_msg> messages;
-            {
-                const common_json j = common_json::parse_no_throw(line);
-                if (j.is_discarded() || !j.contains("messages")) {
-                    n_bad++;
-                    continue;
-                }
-                const common_json & msgs = j.at("messages");
-                for (size_t k = 0; k < msgs.size(); ++k) {
-                    const common_json & m = msgs.at(k);
-                    common_chat_msg msg;
-                    msg.role    = m.value("role",    std::string());
-                    msg.content = m.value("content", std::string());
-
-                    msg.reasoning_content = m.value("reasoning_content", std::string());
-
-                    // OpenAI shaped tool calls, so agent traces can be used as they are
-                    if (m.contains("tool_calls")) {
-                        const common_json & tcs = m.at("tool_calls");
-                        for (size_t t = 0; t < tcs.size(); ++t) {
-                            const common_json & tc = tcs.at(t);
-                            const common_json & fn = tc.contains("function") ? tc.at("function") : tc;
-
-                            common_chat_tool_call call;
-                            call.name      = fn.value("name", std::string());
-                            call.arguments = fn.value("arguments", std::string());
-                            call.id        = tc.value("id", std::string());
-
-                            if (!call.name.empty()) {
-                                msg.tool_calls.push_back(std::move(call));
-                            }
-                        }
-                    }
-
-                    if (msg.role == "tool") {
-                        msg.tool_name    = m.value("name", std::string());
-                        msg.tool_call_id = m.value("tool_call_id", std::string());
-                    }
-
-                    messages.push_back(std::move(msg));
-                }
+            continue;
+        }
+        if (seq.tokens.size() < 2) {
+            if (n_bad++ == 0) {
+                LOG_WRN("%s: line %zu: fewer than two tokens\n", __func__, n_line);
             }
+            continue;
+        }
 
-            train_seq seq;
-            if (seq_from_messages(ctx, tmpls, messages, seq)) {
-                seqs.push_back(std::move(seq));
+        for (llama_token t : seq.tokens) {
+            if (t < 0 || t >= n_vocab) {
+                LOG_ERR("%s: line %zu: token %d is outside the vocabulary of %d\n",
+                        __func__, n_line, t, n_vocab);
+                return false;
             }
         }
-        if (n_bad > 0) {
-            LOG_WRN("%s: skipped %" PRId64 " malformed lines\n", __func__, n_bad);
+
+        seq.labels.assign(seq.tokens.size(), -1);
+        for (size_t i = 0; i + 1 < seq.tokens.size(); ++i) {
+            seq.labels[i] = seq.tokens[i + 1];
         }
-    } else {
-        // plain text: chop into chunks and supervise everything
-        const std::vector<llama_token> tokens = common_tokenize(ctx, text, true, true);
-        for (size_t off = 0; off + 1 < tokens.size(); off += n_ctx_data) {
-            train_seq seq;
-            const size_t n = std::min<size_t>(n_ctx_data, tokens.size() - off);
-            seq.tokens.assign(tokens.begin() + off, tokens.begin() + off + n);
-            seq.labels.assign(n, -1);
-            for (size_t i = 0; i + 1 < n; ++i) {
-                seq.labels[i] = seq.tokens[i + 1];
-            }
-            if (seq.tokens.size() > 1) {
-                seqs.push_back(std::move(seq));
-            }
+        seqs.push_back(std::move(seq));
+    }
+
+    if (n_bad > 0) {
+        LOG_WRN("%s: skipped %" PRId64 " bad lines, the first one is shown above\n", __func__, n_bad);
+    }
+
+    return true;
+}
+
+static std::vector<train_seq> load_text(llama_context * ctx, const std::string & text, int64_t n_ctx) {
+    std::vector<train_seq> seqs;
+
+    const std::vector<llama_token> tokens = common_tokenize(ctx, text, true, true);
+    for (size_t off = 0; off + 1 < tokens.size(); off += n_ctx) {
+        const size_t n = std::min<size_t>(n_ctx, tokens.size() - off);
+
+        train_seq seq;
+        seq.tokens.assign(tokens.begin() + off, tokens.begin() + off + n);
+        seq.labels.assign(n, -1);
+        for (size_t i = 0; i + 1 < n; ++i) {
+            seq.labels[i] = seq.tokens[i + 1];
         }
+        seqs.push_back(std::move(seq));
     }
 
     return seqs;
@@ -202,42 +232,68 @@ int main(int argc, char ** argv) {
     LOG_INF("\n");
     LOG_INF("%s\n", common_params_get_system_info(params).c_str());
 
-    const int64_t n_ctx_data = llama_n_ctx(ctx);
+    const int64_t n_ctx = llama_n_ctx(ctx);
 
-    common_chat_templates_ptr tmpls = common_chat_templates_init(model, params.chat_template);
-
-    std::vector<train_seq> seqs = load_dataset(ctx, tmpls.get(), params.prompt, n_ctx_data);
+    std::vector<train_seq> seqs;
+    if (params.train_format == "tokens") {
+        if (!load_tokens(params.prompt, llama_vocab_n_tokens(llama_model_get_vocab(model)), seqs)) {
+            return 1;
+        }
+    } else if (params.train_format == "text") {
+        seqs = load_text(ctx, params.prompt, n_ctx);
+    } else {
+        common_chat_templates_ptr tmpls = common_chat_templates_init(model, params.chat_template);
+        seqs = load_chat(ctx, tmpls.get(), params.prompt);
+    }
     if (seqs.empty()) {
         LOG_ERR("%s: dataset is empty\n", __func__);
         return 1;
     }
 
-    // pack every sequence into one fixed size datapoint
-    const llama_token pad = llama_vocab_pad(llama_model_get_vocab(model));
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    llama_token pad = llama_vocab_pad(vocab);
+    if (pad == LLAMA_TOKEN_NULL) {
+        pad = llama_vocab_eos(vocab);
+    }
 
     ggml_opt_dataset_t dataset = ggml_opt_dataset_init(
-            GGML_TYPE_I32, GGML_TYPE_I32, n_ctx_data, n_ctx_data, (int64_t) seqs.size(), /*ndata_shard =*/ 1);
+            GGML_TYPE_I32, GGML_TYPE_I32, n_ctx, n_ctx, (int64_t) seqs.size(), /*ndata_shard =*/ 1);
 
     llama_token * data   = (llama_token *) ggml_opt_dataset_data  (dataset)->data;
     llama_token * labels = (llama_token *) ggml_opt_dataset_labels(dataset)->data;
 
     int64_t n_supervised = 0;
+    int64_t n_padded     = 0;
+    int64_t n_cut        = 0;
+    int64_t n_lost       = 0;
     for (size_t i = 0; i < seqs.size(); ++i) {
-        llama_token * d = data   + i*n_ctx_data;
-        llama_token * l = labels + i*n_ctx_data;
+        const train_seq & seq = seqs[i];
+        llama_token * d = data   + i*n_ctx;
+        llama_token * l = labels + i*n_ctx;
 
-        for (int64_t p = 0; p < n_ctx_data; ++p) {
-            const bool inside = p < (int64_t) seqs[i].tokens.size();
-            d[p] = inside ? seqs[i].tokens[p] : pad;
-            l[p] = inside ? seqs[i].labels[p] : -1;
+        for (int64_t p = 0; p < n_ctx; ++p) {
+            const bool inside = p < (int64_t) seq.tokens.size();
+            d[p] = inside ? seq.tokens[p] : pad;
+            l[p] = inside ? seq.labels[p] : -1;
             n_supervised += l[p] >= 0;
+        }
+
+        n_padded += (int64_t) seq.tokens.size() < n_ctx;
+        if ((int64_t) seq.tokens.size() > n_ctx) {
+            n_cut++;
+            for (size_t p = n_ctx; p < seq.labels.size(); ++p) {
+                n_lost += seq.labels[p] >= 0;
+            }
         }
     }
 
-    const double supervised_ratio = (double) n_supervised / (double) (seqs.size()*n_ctx_data);
-
-    LOG_INF("%s: %zu sequences of %" PRId64 " tokens, %.1f%% of the positions are supervised\n",
-            __func__, seqs.size(), n_ctx_data, 100.0*supervised_ratio);
+    LOG_INF("%s: %zu sequences of %" PRId64 " tokens, %.1f%% of the positions are trained on\n",
+            __func__, seqs.size(), n_ctx, 100.0*n_supervised/(seqs.size()*n_ctx));
+    LOG_INF("%s: %" PRId64 " sequences are shorter than -c %" PRId64 " and were padded\n", __func__, n_padded, n_ctx);
+    if (n_cut > 0) {
+        LOG_WRN("%s: %" PRId64 " sequences are longer than -c %" PRId64 " and were cut, losing %" PRId64 " trained tokens\n",
+                __func__, n_cut, n_ctx, n_lost);
+    }
 
     struct lr_opt & lr = params.lr;
 
@@ -266,7 +322,7 @@ int main(int argc, char ** argv) {
                         ggml_opt_epoch_callback_progress_bar, ggml_opt_epoch_callback_progress_bar);
         fprintf(stderr, "\n");
 
-        // checkpoint after every epoch so a long run survives a restart
+        // every epoch is saved, the last one under the -o name
         const std::string path = lr.epoch + 1 == lr.epochs
             ? params.out_file
             : params.out_file + ".epoch" + std::to_string(lr.epoch);

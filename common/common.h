@@ -598,6 +598,7 @@ struct common_params {
     struct lr_opt lr;
     enum ggml_opt_optimizer_type optimizer = GGML_OPT_OPTIMIZER_TYPE_ADAMW;
     float val_split = 0.05f; // fraction of the data used for the validation set
+    std::string train_format = "chat"; // lora-train dataset: chat, tokens or text
 
     // embedding
     bool embedding         = false; // get only sentence embedding
