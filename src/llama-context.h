@@ -220,7 +220,12 @@ struct llama_context {
             ggml_opt_result_t       result_eval,
             int64_t                 idata_split,
             ggml_opt_epoch_callback callback_train,
-            ggml_opt_epoch_callback callback_eval);
+            ggml_opt_epoch_callback callback_eval,
+            const llama_token * const * prefix   = nullptr,  // per datapoint, decoded without gradients in front of it
+            const int32_t             * n_prefix = nullptr);
+
+    // decodes a prefix into the cleared memory, the next training window continues it
+    void opt_prefill(const llama_token * tokens, int32_t n_tokens);
 
     void opt_epoch_iter(
             ggml_opt_dataset_t               dataset,
@@ -232,7 +237,8 @@ struct llama_context {
             bool                             train,
             int64_t                          idata_in_loop,
             int64_t                          ndata_in_loop,
-            int64_t                          t_loop_start);
+            int64_t                          t_loop_start,
+            uint32_t                         n_past = 0);
 
 private:
     //

@@ -479,7 +479,9 @@ static void print_mask(const T * data, int64_t n_tokens, int64_t n_kv, int64_t n
 }
 
 void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
-    const int64_t n_kv     = ubatch->n_tokens;
+    // the prefix keys come first: the tokens at positions 0..n_prefix-1 of the same sequence, already in memory
+    const int64_t n_prefix = cparams.lora_prefix;
+    const int64_t n_kv     = n_prefix + ubatch->n_tokens;
     const int64_t n_tokens = ubatch->n_tokens;
 
     const auto fill_mask = [&](auto * data, int64_t ne, int n_swa, llama_swa_type swa_type) {
@@ -492,9 +494,9 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
 
             const uint64_t idst = i1*n_kv;
 
-            for (int i0 = 0; i0 < n_tokens; ++i0) {
-                const llama_seq_id s0 = ubatch->seq_id[i0][0];
-                const llama_pos p0    = ubatch->pos[i0];
+            for (int i0 = 0; i0 < n_kv; ++i0) {
+                const llama_seq_id s0 = i0 < n_prefix ? s1 : ubatch->seq_id[i0 - n_prefix][0];
+                const llama_pos p0    = i0 < n_prefix ? i0 : ubatch->pos[i0 - n_prefix];
 
                 // mask different sequences
                 if (s0 != s1) {
@@ -2788,14 +2790,17 @@ llm_graph_input_attn_no_cache * llm_graph_context::build_attn_inp_no_cache() con
     // flash attention requires an f16 mask
     const auto type_mask = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
 
-    // note: there is no KV cache, so the number of KV values is equal to the number of tokens in the batch
-    inp->self_kq_mask = ggml_new_tensor_4d(ctx0, type_mask, n_tokens, n_tokens, 1, 1);
+    // note: there is no KV cache, so the number of KV values is equal to the number of tokens in the batch,
+    //       plus the prefix a training sequence attends to
+    const int64_t n_kv = cparams.lora_prefix + n_tokens;
+
+    inp->self_kq_mask = ggml_new_tensor_4d(ctx0, type_mask, n_kv, n_tokens, 1, 1);
     ggml_set_input(inp->self_kq_mask);
 
     inp->self_kq_mask_cnv = inp->self_kq_mask;
 
     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
-        inp->self_kq_mask_swa = ggml_new_tensor_4d(ctx0, type_mask, n_tokens, n_tokens, 1, 1);
+        inp->self_kq_mask_swa = ggml_new_tensor_4d(ctx0, type_mask, n_kv, n_tokens, 1, 1);
         ggml_set_input(inp->self_kq_mask_swa);
 
         inp->self_kq_mask_swa_cnv = inp->self_kq_mask_swa;

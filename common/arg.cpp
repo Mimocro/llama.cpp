@@ -4448,7 +4448,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--train-format"}, "chat|tokens|text",
         "dataset format (default: chat)\n"
         "chat: JSONL, one {\"messages\": [...], \"tools\": [...]} per line, rendered with the jinja template, only assistant turns are trained on\n"
-        "tokens: JSONL, one {\"tokens\": [...]} per line, token ids taken as is, every token is trained on\n"
+        "tokens: JSONL, one {\"tokens\": [...]} per line, token ids taken as is, every token is trained on;\n"
+        "  with {\"context\": [...]} the context is decoded without gradients in front of the tokens, the window is then -ub and -c holds the context plus the window\n"
         "text: the file as it is, every token is trained on",
         [](common_params & params, const std::string & value) {
             if (value != "chat" && value != "tokens" && value != "text") {

@@ -1,4 +1,5 @@
 #include "models.h"
+#include "llama-memory-hybrid.h"
 #include "llama-memory-recurrent.h"
 
 // ggml_ssm_conv has no backward pass, so training runs the same convolution as a sum of taps
@@ -414,6 +415,32 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     cb(Qcur, "Qcur", il);
     cb(Kcur, "Kcur", il);
     cb(Vcur, "Vcur", il);
+
+    // training after a prefix: the prefix was decoded into the KV cache without gradients,
+    // its keys and values stand in front of the window as constants
+    if (inp_nc && cparams.lora_prefix > 0) {
+        const auto *  kv       = static_cast<const llama_memory_hybrid_context *>(mctx)->get_attn();
+        const int64_t n_prefix = cparams.lora_prefix;
+
+        ggml_tensor * k = kv->get_k(ctx0, il);
+        k = ggml_view_3d(ctx0, k, k->ne[0], k->ne[1], n_prefix, k->nb[1], k->nb[2], 0);
+        k = ggml_cast(ctx0, k, GGML_TYPE_F32);
+
+        ggml_tensor * v = kv->get_v(ctx0, il);
+        if (v->nb[1] > v->nb[2]) {
+            // transposed V cache: [n_kv, n_head_kv, n_embd_head]
+            v = ggml_view_3d(ctx0, v, n_prefix, v->ne[1], v->ne[2], v->nb[1], v->nb[2], 0);
+            v = ggml_permute(ctx0, v, 2, 1, 0, 3);
+        } else {
+            v = ggml_view_3d(ctx0, v, v->ne[0], v->ne[1], n_prefix, v->nb[1], v->nb[2], 0);
+        }
+        v = ggml_cast(ctx0, v, GGML_TYPE_F32);
+
+        Kcur = ggml_concat(ctx0, k, ggml_cont(ctx0, Kcur), 2);
+        Vcur = ggml_concat(ctx0, v, ggml_cont(ctx0, Vcur), 2);
+        cb(Kcur, "Kcur_prefix", il);
+        cb(Vcur, "Vcur_prefix", il);
+    }
 
     // Attention computation
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;

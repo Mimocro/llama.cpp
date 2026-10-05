@@ -17,7 +17,8 @@
 
 struct train_seq {
     std::vector<llama_token> tokens;
-    std::vector<llama_token> labels; // -1 marks a position that does not contribute to the loss
+    std::vector<llama_token> labels;  // -1 marks a position that does not contribute to the loss
+    std::vector<llama_token> context; // decoded without gradients in front of tokens, may be empty
 };
 
 static std::string render(
@@ -137,7 +138,11 @@ static bool load_tokens(const std::string & text, int32_t n_vocab, std::vector<t
 
         train_seq seq;
         try {
-            seq.tokens = common_json::parse(line).at("tokens").get<std::vector<int>>();
+            const common_json j = common_json::parse(line);
+            seq.tokens = j.at("tokens").get<std::vector<int>>();
+            if (j.contains("context")) {
+                seq.context = j.at("context").get<std::vector<int>>();
+            }
         } catch (const std::exception & e) {
             if (n_bad++ == 0) {
                 LOG_WRN("%s: line %zu: %s\n", __func__, n_line, e.what());
@@ -151,11 +156,13 @@ static bool load_tokens(const std::string & text, int32_t n_vocab, std::vector<t
             continue;
         }
 
-        for (llama_token t : seq.tokens) {
-            if (t < 0 || t >= n_vocab) {
-                LOG_ERR("%s: line %zu: token %d is outside the vocabulary of %d\n",
-                        __func__, n_line, t, n_vocab);
-                return false;
+        for (const auto * part : { &seq.context, &seq.tokens }) {
+            for (llama_token t : *part) {
+                if (t < 0 || t >= n_vocab) {
+                    LOG_ERR("%s: line %zu: token %d is outside the vocabulary of %d\n",
+                            __func__, n_line, t, n_vocab);
+                    return false;
+                }
             }
         }
 
@@ -250,6 +257,29 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // with a context in front of the sequences the window is -ub, and -c holds the context plus the window
+    const bool prefixed = std::any_of(seqs.begin(), seqs.end(), [](const train_seq & s) { return !s.context.empty(); });
+    const int64_t n_win = prefixed ? (int64_t) llama_n_ubatch(ctx) : n_ctx;
+    if (prefixed && n_win >= n_ctx) {
+        LOG_ERR("%s: the sequences have a context, so -c %" PRId64 " must hold it and the -ub %" PRId64 " window\n",
+                __func__, n_ctx, n_win);
+        return 1;
+    }
+
+    // the oldest context tokens go first when the context does not fit
+    std::vector<const llama_token *> prefix  (seqs.size());
+    std::vector<int32_t>             n_prefix(seqs.size());
+    int64_t n_short = 0;
+    int64_t n_long  = 0;
+    for (size_t i = 0; i < seqs.size(); ++i) {
+        const auto & c = seqs[i].context;
+        const size_t keep = std::min<size_t>(c.size(), n_ctx - n_win);
+        n_short += c.size() > keep;
+        n_long   = std::max<int64_t>(n_long, keep);
+        prefix[i]   = c.data() + c.size() - keep;
+        n_prefix[i] = (int32_t) keep;
+    }
+
     const llama_vocab * vocab = llama_model_get_vocab(model);
     llama_token pad = llama_vocab_pad(vocab);
     if (pad == LLAMA_TOKEN_NULL) {
@@ -257,7 +287,7 @@ int main(int argc, char ** argv) {
     }
 
     ggml_opt_dataset_t dataset = ggml_opt_dataset_init(
-            GGML_TYPE_I32, GGML_TYPE_I32, n_ctx, n_ctx, (int64_t) seqs.size(), /*ndata_shard =*/ 1);
+            GGML_TYPE_I32, GGML_TYPE_I32, n_win, n_win, (int64_t) seqs.size(), /*ndata_shard =*/ 1);
 
     llama_token * data   = (llama_token *) ggml_opt_dataset_data  (dataset)->data;
     llama_token * labels = (llama_token *) ggml_opt_dataset_labels(dataset)->data;
@@ -268,31 +298,37 @@ int main(int argc, char ** argv) {
     int64_t n_lost       = 0;
     for (size_t i = 0; i < seqs.size(); ++i) {
         const train_seq & seq = seqs[i];
-        llama_token * d = data   + i*n_ctx;
-        llama_token * l = labels + i*n_ctx;
+        llama_token * d = data   + i*n_win;
+        llama_token * l = labels + i*n_win;
 
-        for (int64_t p = 0; p < n_ctx; ++p) {
+        for (int64_t p = 0; p < n_win; ++p) {
             const bool inside = p < (int64_t) seq.tokens.size();
             d[p] = inside ? seq.tokens[p] : pad;
             l[p] = inside ? seq.labels[p] : -1;
             n_supervised += l[p] >= 0;
         }
 
-        n_padded += (int64_t) seq.tokens.size() < n_ctx;
-        if ((int64_t) seq.tokens.size() > n_ctx) {
+        n_padded += (int64_t) seq.tokens.size() < n_win;
+        if ((int64_t) seq.tokens.size() > n_win) {
             n_cut++;
-            for (size_t p = n_ctx; p < seq.labels.size(); ++p) {
+            for (size_t p = n_win; p < seq.labels.size(); ++p) {
                 n_lost += seq.labels[p] >= 0;
             }
         }
     }
 
     LOG_INF("%s: %zu sequences of %" PRId64 " tokens, %.1f%% of the positions are trained on\n",
-            __func__, seqs.size(), n_ctx, 100.0*n_supervised/(seqs.size()*n_ctx));
-    LOG_INF("%s: %" PRId64 " sequences are shorter than -c %" PRId64 " and were padded\n", __func__, n_padded, n_ctx);
+            __func__, seqs.size(), n_win, 100.0*n_supervised/(seqs.size()*n_win));
+    LOG_INF("%s: %" PRId64 " sequences are shorter than %" PRId64 " and were padded\n", __func__, n_padded, n_win);
     if (n_cut > 0) {
-        LOG_WRN("%s: %" PRId64 " sequences are longer than -c %" PRId64 " and were cut, losing %" PRId64 " trained tokens\n",
-                __func__, n_cut, n_ctx, n_lost);
+        LOG_WRN("%s: %" PRId64 " sequences are longer than %" PRId64 " and were cut, losing %" PRId64 " trained tokens\n",
+                __func__, n_cut, n_win, n_lost);
+    }
+    if (prefixed) {
+        LOG_INF("%s: the sequences continue a context of up to %" PRId64 " tokens, decoded without gradients\n", __func__, n_long);
+    }
+    if (n_short > 0) {
+        LOG_WRN("%s: %" PRId64 " contexts are longer than -c minus the window and lost their oldest tokens\n", __func__, n_short);
     }
 
     struct lr_opt & lr = params.lr;
@@ -303,7 +339,7 @@ int main(int argc, char ** argv) {
             (double) params.val_split);
 
     struct llama_opt_params lopt_params {
-        /*n_ctx_train     =*/ 0,
+        /*n_ctx_train     =*/ prefixed ? (uint32_t) n_win : 0,
         /*param_filter    =*/ llama_opt_param_filter_all,
         /*param_filter_ud =*/ nullptr,
         /*get_opt_pars    =*/ common_opt_lr_pars,
@@ -318,8 +354,13 @@ int main(int argc, char ** argv) {
     ggml_opt_result_t result_eval  = ggml_opt_result_init();
 
     for (lr.epoch = 0; lr.epoch < lr.epochs; ++lr.epoch) {
-        llama_opt_epoch(ctx, dataset, result_train, result_eval, idata_split,
-                        ggml_opt_epoch_callback_progress_bar, ggml_opt_epoch_callback_progress_bar);
+        if (prefixed) {
+            llama_opt_epoch_prefix(ctx, dataset, prefix.data(), n_prefix.data(), result_train, result_eval, idata_split,
+                                   ggml_opt_epoch_callback_progress_bar, ggml_opt_epoch_callback_progress_bar);
+        } else {
+            llama_opt_epoch(ctx, dataset, result_train, result_eval, idata_split,
+                            ggml_opt_epoch_callback_progress_bar, ggml_opt_epoch_callback_progress_bar);
+        }
         fprintf(stderr, "\n");
 
         // every epoch is saved, the last one under the -o name

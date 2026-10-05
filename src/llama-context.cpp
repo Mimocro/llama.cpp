@@ -3671,19 +3671,24 @@ void llama_context::opt_epoch_iter(
         bool                             train,
         int64_t                          idata_in_loop,
         int64_t                          ndata_in_loop,
-        int64_t                          t_loop_start) {
+        int64_t                          t_loop_start,
+        uint32_t                         n_past) {
     GGML_ASSERT(opt_ctx);
     const uint32_t n_ctx    = llama_model_n_ctx_train(&model);
     const uint32_t n_batch  = std::min(this->n_batch(),  n_ctx);
     const uint32_t n_ubatch = std::min(this->n_ubatch(), n_batch);
 
-    memory->clear(true);
+    GGML_ASSERT(n_past == 0 || n_ubatch == n_ctx);
+    if (n_past == 0) {
+        memory->clear(true);
+    }
+    cparams.lora_prefix = n_past;
 
     for (uint32_t pos_ctx = 0; pos_ctx < n_ctx; pos_ctx += n_batch) {
         batch.n_tokens = n_batch;
         for (uint32_t pos_batch = 0; pos_batch < n_batch; ++pos_batch) {
             batch.token   [pos_batch]    = tokens[pos_ctx + pos_batch];
-            batch.pos     [pos_batch]    = pos_ctx + pos_batch;
+            batch.pos     [pos_batch]    = n_past + pos_ctx + pos_batch;
             batch.n_seq_id[pos_batch]    = 1;
             batch.seq_id  [pos_batch][0] = 0;
             batch.logits  [pos_batch]    = true;
@@ -3775,14 +3780,39 @@ void llama_context::opt_epoch_iter(
     }
 }
 
+void llama_context::opt_prefill(const llama_token * tokens, int32_t n_tokens) {
+    memory->clear(true);
+
+    // the prefix goes through the inference graph: it fills the KV cache and the recurrent state, without gradients.
+    // a training graph left in gf_res_prev must not be reused for it
+    const bool training = cparams.lora_training;
+    const bool no_reuse = graph_reuse_disable;
+    cparams.lora_training = false;
+    graph_reuse_disable   = true;
+
+    for (int32_t i = 0; i < n_tokens; i += (int32_t) cparams.n_batch) {
+        const int32_t n = std::min<int32_t>(cparams.n_batch, n_tokens - i);
+        if (decode(llama_batch_get_one(const_cast<llama_token *>(tokens + i), n)) != 0) {
+            GGML_ABORT("%s: failed to decode the prefix", __func__);
+        }
+    }
+    synchronize();
+
+    cparams.lora_training = training;
+    graph_reuse_disable   = no_reuse;
+}
+
 void llama_context::opt_epoch(
         ggml_opt_dataset_t        dataset,
         ggml_opt_result_t         result_train,
         ggml_opt_result_t         result_eval,
         int64_t                   idata_split,
         ggml_opt_epoch_callback   callback_train,
-        ggml_opt_epoch_callback   callback_eval) {
-    const uint32_t n_ctx    = this->n_ctx();
+        ggml_opt_epoch_callback   callback_eval,
+        const llama_token * const * prefix,
+        const int32_t             * n_prefix) {
+    // the window of a datapoint, the context also holds the prefix in front of it
+    const uint32_t n_ctx    = llama_model_n_ctx_train(&model);
     const uint32_t n_batch  = std::min(cparams.n_batch,  n_ctx);
     const uint32_t n_ubatch = std::min(cparams.n_ubatch, n_batch);
     const  int64_t ndata    = ggml_opt_dataset_ndata(dataset);
@@ -3796,6 +3826,14 @@ void llama_context::opt_epoch(
     std::vector<llama_token>        tokens(n_ctx);
     std::vector<llama_token> labels_sparse(n_ctx);
 
+    const auto past = [&](int64_t idata) -> uint32_t {
+        if (!prefix || n_prefix[idata] == 0) {
+            return 0;
+        }
+        opt_prefill(prefix[idata], n_prefix[idata]);
+        return n_prefix[idata];
+    };
+
     int64_t idata = 0;
 
     int64_t t_loop_start = ggml_time_us();
@@ -3806,7 +3844,7 @@ void llama_context::opt_epoch(
 
         ggml_opt_dataset_get_batch_host(dataset, tokens.data(), n_ctx*sizeof(llama_token), labels_sparse.data(), idata);
         opt_epoch_iter(dataset, result_train, tokens, labels_sparse, batch,
-            callback_train, train, idata_in_loop, ndata_in_loop, t_loop_start);
+            callback_train, train, idata_in_loop, ndata_in_loop, t_loop_start, past(idata));
     }
 
     t_loop_start = ggml_time_us();
@@ -3817,8 +3855,10 @@ void llama_context::opt_epoch(
 
         ggml_opt_dataset_get_batch_host(dataset, tokens.data(), n_ctx*sizeof(llama_token), labels_sparse.data(), idata);
         opt_epoch_iter(dataset, result_eval, tokens, labels_sparse, batch,
-            callback_eval, train, idata_in_loop, ndata_in_loop, t_loop_start);
+            callback_eval, train, idata_in_loop, ndata_in_loop, t_loop_start, past(idata));
     }
+
+    cparams.lora_prefix = 0;
 
     llama_batch_free(batch);
 }
@@ -4564,6 +4604,27 @@ void llama_opt_epoch(
         idata_split,
         callback_train,
         callback_eval);
+}
+
+void llama_opt_epoch_prefix(
+        struct llama_context      * ctx,
+        ggml_opt_dataset_t          dataset,
+        const llama_token * const * prefix,
+        const int32_t             * n_prefix,
+        ggml_opt_result_t           result_train,
+        ggml_opt_result_t           result_eval,
+        int64_t                     idata_split,
+        ggml_opt_epoch_callback     callback_train,
+        ggml_opt_epoch_callback     callback_eval) {
+    ctx->opt_epoch(
+        dataset,
+        result_train,
+        result_eval,
+        idata_split,
+        callback_train,
+        callback_eval,
+        prefix,
+        n_prefix);
 }
 
 //
